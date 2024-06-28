@@ -1,0 +1,243 @@
+/**
+   The MySensors Arduino library handles the wireless radio link and protocol
+   between your home built sensors/actuators and HA controller of choice.
+   The sensors forms a self healing radio network with optional repeaters. Each
+   repeater and gateway builds a routing tables in EEPROM which keeps track of the
+   network topology allowing messages to be routed to nodes.
+
+   Created by Henrik Ekblad <henrik.ekblad@mysensors.org>
+   Copyright (C) 2013-2015 Sensnology AB
+   Full contributor list: https://github.com/mysensors/Arduino/graphs/contributors
+
+   Documentation: http://www.mysensors.org
+   Support Forum: http://forum.mysensors.org
+
+   This program is free software; you can redistribute it and/or
+   modify it under the terms of the GNU General Public License
+   version 2 as published by the Free Software Foundation.
+
+ *******************************
+   Adapted from DhtTemperatureAndHumiditySensor from MySensors
+   REVISION HISTORY
+   Version 1.0: Philip Ullage
+   Version 1.1 - 2016-07-20: Converted to MySensors v2.0 and added various improvements - Torben Woltjen (mozzbozz)
+
+
+   DESCRIPTION
+   This sketch provides a way of using water pressure sensor values within the framwork of the
+   MySensors multimeter sensor data types to determine pressure loss across a water filter.
+
+   A greater drop in pressure across the filter means the filter is becomming more clogged.
+   When a faucet is turned on, there is a pressure drop in the system on both sides of the filter.
+   This sketch therfore measures and reports the relative pressure loss across the filter,
+   not the absolute pressure drop when water is flowing.
+
+   Hardware used: two 5v water pressure sensors (output 0.5 to 4.5 VDC), Arduino Nano, momentary
+   push button, red LED, NRF24l01, Nano IO shield with NRF2401 socket, assorted hardware.
+
+   The two sensors calibrate to each other upon button push. Push the button when the
+   filter's bypass valve (if it exists) is open, or after sufficient time has equalized pressure on 
+   both sensors. If there is no bypass valve, wait about a minute of no water flowing through the sensor,
+   then push the button.  Upon button push, the sensors zero to each other, 
+    the "Change filter now" LED turns off, and variables are reset.
+
+   Arduino analog pins return values from 0 to 1023.
+
+   A 15 psi drop across the sensor is a difference of about 70-75 in Arduino's analog read.
+   PSI    bar     Arduino read
+   40 psi  2.75       304
+   30 psi  2.06       247
+   25 psi  1.72       230.
+   20 psi  1.38       200
+   10 psi  0.68       175
+   5       0.34       165
+   0            about 100
+
+   Sensor output vs pressure is treated as linear. There is a 200 range in Arduino data covering the
+  40 psi of pressure change(see above), making about 5 value counts per psi.
+
+   This sketch treats the sensor values as if they are from a multimeter. It sends 1) the highest percentClog recorded
+   so far  and 2) The present percentClog.
+
+   Wiring:
+   Analog 1 is prefilter voltage
+   Analog 3 is postfilter voltage
+   Long leg of LED is on digital 3, attached through a 220 ohm resistor. Short leg goes to ground.
+   Button is on digital 2. Button push should make digital 1 read HIGH. See Arduino documentation for
+      the use of a resistor to force the pin LOW.
+   Radio uses digital pins 9, 10, 11, 12, 13 according to MySensors Wiring the Radio.
+*/
+
+// Enable debug prints
+#define MY_DEBUG
+#define MY_DEBUG_VERBOSE_RF24  //this needs to be enabled to work with MySensors 2.2 dev.
+#define MY_NODE_ID 20
+
+// Enable and select radio type attached
+#define MY_RADIO_NRF24
+//#define MY_RADIO_RFM69
+//#define MY_RS485
+
+#include <SPI.h>
+#include <MySensors.h>
+
+// user defined pins
+const int analogPinPrefilter = 1;   //analog pin A1 is water pressure before filter
+const int analogPinPostfilter = 3;  //analog pin A3 is water pressure after filter
+const int ledPin = 3;               // Arduino digital LED pin. Shows filter needs changing.
+const int buttonPin = 2;            //Arduino digital pin that reads the state of the reset button
+
+//user defined vars
+int limPressDrop  = 15;  //the percentage (as integer) of pressure loss allowed across the filter
+// Sleep time between sensor readings (in milliseconds)
+static const uint64_t UPDATE_INTERVAL = 1000;
+// Force sending an update of the pressure after n sensor reads, so a controller showing the
+// timestamp of the last update doesn't show something like 3 hours in the unlikely case that
+// the value didn't change in that time;
+// i.e. the sensor would force sending an update every UPDATE_INTERVAL*FORCE_UPDATE_N_READS [ms]
+static const uint8_t FORCE_UPDATE_N_READS = 600;
+
+//runtime vars
+int valPreFilter = 0;        // raw PreFilter analog sensor value
+int valPostFilter = 0;      // raw Postflter analog sensor value
+
+//Calibration values for sensors when both pre- and post- are physically equal pressure.
+//These are reset when button is pressed.
+int preFilterBaseline = 0;
+int postFilterBaseline = 0;
+int avgPressure = 0; //average pressure between the two sensors
+int adjustedPrefilter = 0; //calibrated reading
+int adjustedPostfilter = 0; //calibrated reading
+int adjustedVolDiff = 0; // (difference between calibrated pre- and post- sensor values) * 100
+int percentClog = 0;//Percent drop in pressure across filter
+int highestClog = 0;  //Highest percentage of filter clog recorded so far
+int lastAverage = 0; // last value of percent clogged
+int percentRemaining = 0; //Filter clog / limPressDrop
+bool changeFilterNeeded = false;
+uint8_t nNoUpdatesPclog; // counts readings since last update
+
+//Data smoothing
+const int numReadings = 10;
+
+int readings[numReadings];      // the asjusted percentClog
+int readIndex = 0;              // the index of the current reading
+int total = 0;                  // the running total
+int average = 0;                // the average
+
+
+#define CHILD_ID_UPS 0   //upstream sensor value 
+#define CHILD_ID_DWNS 1  //downstream sensor value
+
+
+MyMessage msgUps(CHILD_ID_UPS, V_VOLTAGE);    //from S_MULTIMETER
+MyMessage msgDwns(CHILD_ID_DWNS, V_CURRENT);  //from S_MULTIMETER
+
+
+void presentation()
+{
+  // Send the sketch version information to the gateway
+  sendSketchInfo("WaterPressure", "1.5");
+
+  // Register all sensors to gw (they will be created as child devices)
+  present(CHILD_ID_UPS, S_MULTIMETER, "Prefilter");
+  present(CHILD_ID_DWNS, S_MULTIMETER, "Postfilter");
+}
+
+void setup()
+{
+  pinMode(ledPin, OUTPUT);     // initialize the digital pin as an output for LED.
+  pinMode(buttonPin, INPUT);   // intialize the digital pin as button input
+   // initialize all the readings to 0:
+  for (int thisReading = 0; thisReading < numReadings; thisReading++) {
+    readings[thisReading] = 0;
+  }
+  
+}
+
+
+  void loop() {
+    // Get raw readings
+    valPreFilter = analogRead(analogPinPrefilter);    // read the Prefilter pressure input pin  0-1023
+    valPostFilter = analogRead(analogPinPostfilter);    // read the Postfilter pressure input pin 0-1023
+
+    //When the reset button is pushed, the raw values from each sensor are zeroed. Each sensor gets an
+    //offset value.
+
+    if (digitalRead(buttonPin) == HIGH)
+    {
+      avgPressure = (valPreFilter + valPostFilter) / 2;
+      preFilterBaseline = avgPressure - valPreFilter;  //determines the offset for the sensor
+      postFilterBaseline = avgPressure - valPostFilter; //determines the offset for the sensor
+      changeFilterNeeded = false;
+      highestClog = 0;
+    }
+
+    adjustedPrefilter = valPreFilter + preFilterBaseline;  //adjusts for offset
+    adjustedPostfilter = valPostFilter + postFilterBaseline;//adjusts for offset
+
+    // the (*100) in the next line expresses percentClog as an integer rather than decimal
+    adjustedVolDiff = (adjustedPrefilter - adjustedPostfilter) * 100;
+    percentClog = adjustedVolDiff / adjustedPrefilter;
+
+    //In case random sensor variability makes downstream pressure higher than upstream pressure,
+    //especially when there is no water flow, use absolute value to prevent errors in calculations.
+    percentClog = abs(percentClog);
+
+    //Sets highestClog
+    if (percentClog > highestClog)
+    {
+      highestClog = percentClog;
+    }
+
+    //if the pressure difference has been greater than allowed, set a flag.
+
+    if (percentClog > limPressDrop)
+    {
+      changeFilterNeeded = true;
+    }
+
+    if (changeFilterNeeded == true)
+    {
+      digitalWrite(ledPin, HIGH);   // turn the LED on
+    }
+    else
+    {
+      digitalWrite(ledPin, LOW);
+    }
+    
+    // subtract the last reading:
+    total = total - readings[readIndex];
+    readings[readIndex] = percentClog;
+     // add the reading to the total:
+    total = total + readings[readIndex];
+     // advance to the next position in the array:
+    readIndex = readIndex + 1;
+     // if we're at the end of the array...
+    if (readIndex >= numReadings) {
+    // ...wrap around to the beginning:
+    readIndex = 0;
+    }
+    // calculate the average:
+    average = total / numReadings;
+    
+    // Only send value if it changed since the last measurement or if we didn't send an update for n times.
+    
+    if (((average != lastAverage) && (average > 2)) || nNoUpdatesPclog == FORCE_UPDATE_N_READS)
+    {
+      lastAverage = average;
+      percentRemaining = (highestClog * 100) / limPressDrop;
+      // Reset no updates counter
+      nNoUpdatesPclog = 0;
+      //send data to gateway
+      send(msgUps.set(percentClog, 1));
+      send(msgDwns.set(percentRemaining, 1));
+      //     send(msgEOL.set(percentClog, 1));
+      wait(UPDATE_INTERVAL);
+    }
+    else
+    {
+      // Increase no update counter if the humidity stayed the same
+      nNoUpdatesPclog++;
+      wait(UPDATE_INTERVAL);
+    }
+  }
