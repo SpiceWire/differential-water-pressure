@@ -1,4 +1,4 @@
-# differential-water-pressure
+# Differential Water Pressure Across a Filter
 
 This Arduino sketch reads water pressure sensors on each side of a water filter and alerts when the filter needs changing. 
 It implements the MySensors library to send the sensor values through a gateway to a home automation program for
