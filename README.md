@@ -6,8 +6,10 @@ display and monitoring.
 
 ## Background
 
-I wanted an objective way to determine if a whole-house water filter neeeded changing. I decided that I could tolerate a
-15 psi (1 bar) drop in water pressure across the filter. There are a few factors to consider when measuring pressure drop:
+I wanted an objective way to determine if my whole-house water filter neeeded changing. I decided that I could tolerate a
+15 psi (1 bar) drop in water pressure across the filter. 
+
+I needed to measure pressure on both sides of the filter. There are a few factors to consider when measuring pressure drop:
 flowing water has less pressure than stationary water, supply water pressure fluctuates during the day and between days,
 and differing baseline voltages of the sensors. This sketch therefore measures and reports relative pressure
 loss across the water filter, not the absolute pressure drop when water flows across the filter. 
